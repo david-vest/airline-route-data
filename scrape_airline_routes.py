@@ -1,13 +1,14 @@
 #!/usr/bin/python
 from collections import defaultdict
 import json
+import os
 import re
 import sys
 import time
 
 from curl_cffi import requests
 from geopy.distance import geodesic
-import lxml.html
+
 
 
 def clean_coord_str(val):
@@ -24,17 +25,59 @@ def clean_coord_str(val):
     return "0.0"
 
 
-if __name__ == "__main__":
-    print("Fetching airports list...")
+def fetch(session, url, parse, allow_not_found=False):
+    for attempt in range(1, 4):
+        try:
+            response = session.get(url, timeout=30)
+            if response.status_code == 404 and allow_not_found:
+                return None
+            if (response.headers.get("cf-mitigated") == "challenge"
+                    or "window._cf_chl_opt" in response.text):
+                raise ValueError(
+                    "Cloudflare blocked this request. Use an allowed runner/IP "
+                    "or configure FLIGHTSFROM_PROXY; browser impersonation alone "
+                    "cannot solve a JavaScript challenge."
+                )
+            response.raise_for_status()
+            return parse(response)
+        except (requests.RequestsError, ValueError) as error:
+            if attempt == 3:
+                raise RuntimeError(
+                    f"Failed to fetch {url} after {attempt} attempts: {error}"
+                ) from error
+            print(f"! {url}: {error}; retrying in {attempt * 5}s...", flush=True)
+            time.sleep(attempt * 5)
 
-    response = requests.get(
-        "https://www.flightsfrom.com/airports", impersonate="chrome"
+
+def parse_airports(response):
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("response", {}).get("airports"):
+        raise ValueError("Response did not contain a nonempty airport list")
+    return data
+
+
+def parse_metadata(response):
+    data = response.json()
+    metadata = data.get("response") if isinstance(data, dict) else None
+    if (not isinstance(metadata, dict)
+            or not isinstance(metadata.get("airport"), dict)
+            or not metadata["airport"].get("IATA")
+            or not isinstance(metadata.get("routes"), list)):
+        raise ValueError("Response did not contain airport and routes metadata")
+    return metadata
+
+
+def main():
+    session = requests.Session(
+        impersonate="chrome", proxy=os.environ.get("FLIGHTSFROM_PROXY") or None,
+        headers={
+            "Accept": "application/json",
+            "Origin": "https://www.flightsfrom.com",
+            "Referer": "https://www.flightsfrom.com/",
+        },
     )
-    try:
-        airports_json = json.loads(response.content)
-    except json.decoder.JSONDecodeError as e:
-        print("Failed to load airport JSON, page body was: '%s'" % response.content)
-        sys.exit(1)
+    print("Fetching airports list...")
+    airports_json = fetch(session, "https://www.flightsfrom.com/airports", parse_airports)
 
     iatas = [airport["IATA"] for airport in airports_json["response"]["airports"]]
 
@@ -47,47 +90,16 @@ if __name__ == "__main__":
 
         print("Fetching #%s: %s" % (len(airports), iata))
 
-        skip_iata = False
-        while True:
-            try:
-                response = requests.get(
-                    "https://www.flightsfrom.com/%s/destinations" % iata,
-                    impersonate="chrome"
-                )
-                if response.status_code == 404:
-                    print("! Airport %s not found (404), skipping" % iata)
-                    skip_iata = True
-                    break
-                if response.status_code != 200:
-                    print("! HTTP %s error while fetching %s, retrying after 5s..." % (response.status_code, iata))
-                    time.sleep(5)
-                    continue
-
-                root = lxml.html.document_fromstring(response.content)
-                metadata_nodes = root.xpath('//script[contains(., "window.airport")]')
-                if not metadata_nodes:
-                    print("! Could not find window.airport metadata on page for %s (status: %s), retrying after 5s..." % (iata, response.status_code))
-                    time.sleep(5)
-                    continue
-
-                metadata_tag = metadata_nodes[0].text_content()
-                metadata_bits = metadata_tag.split("window.")
-                break
-            except Exception as e:
-                status_str = "N/A"
-                if 'response' in locals() and response is not None:
-                    status_str = str(response.status_code)
-                print("! Error while fetching IATA %s: %s (status: %s). Sleeping 5s before retrying..." % (iata, e, status_str))
-                time.sleep(5)
-
-        if skip_iata:
+        metadata = fetch(
+            session,
+            "https://www.flightsfrom.com/api/airport/%s?from=%s" % (iata, iata),
+            parse_metadata,
+            allow_not_found=True,
+        )
+        if metadata is None:
+            print("! Airport %s not found (404), skipping" % iata)
             continue
 
-        metadata = {}
-        for bit in metadata_bits:
-            split = bit.find("=")
-            if split != -1:
-                metadata[bit[:split].strip()] = json.loads(bit.strip()[split + 2 : -1])
 
         airport_fields = [
             "city_name",
@@ -169,3 +181,11 @@ if __name__ == "__main__":
 
     with open("airline_routes.json", "w") as f:
         f.write(json.dumps(airports, indent=4, sort_keys=True, separators=(",", ": ")))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
